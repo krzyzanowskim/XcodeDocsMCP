@@ -332,17 +332,64 @@ final class MCPServer {
     // MARK: - Tool Implementations
 
     private func searchDocumentation(query: String, limit: Int) async -> String {
-        // Use mdfind to search Spotlight for documentation
+        var allResults: [(path: String, score: Int)] = []
+
+        // Strategy 1: Search documentation cache with better query
+        let docResults = await searchSpotlightDocumentation(query: query)
+        allResults.append(contentsOf: docResults)
+
+        // Strategy 2: Search SDK headers if we don't have enough results
+        if allResults.count < limit {
+            let headerResults = await searchInSDKHeaders(query: query, limit: limit)
+            // Parse header results into paths (this returns formatted string, so we'll handle separately)
+            if !headerResults.contains("No documentation found") && !headerResults.contains("Error") {
+                return formatCombinedResults(spotlightResults: allResults, headerResults: headerResults, query: query, limit: limit)
+            }
+        }
+
+        // Strategy 3: Try case-insensitive symbol name search in frameworks
+        if allResults.count < 5 {
+            let symbolResults = await searchSymbolAcrossFrameworks(query: query, limit: 10)
+            if !symbolResults.isEmpty {
+                return formatSymbolSearchResults(results: symbolResults, query: query)
+            }
+        }
+
+        if allResults.isEmpty {
+            return "No documentation found for '\(query)'.\n\nSuggestions:\n- Try searching for a more specific symbol name\n- Use get_symbol_info if you know the framework (e.g., Foundation, SwiftUI)\n- Use list_frameworks to see available frameworks"
+        }
+
+        // Sort by relevance score and format results
+        let sortedResults = allResults
+            .sorted { $0.score > $1.score }
+            .prefix(limit)
+
+        return formatSpotlightResults(results: sortedResults.map { $0.path }, query: query)
+    }
+
+    private func searchSpotlightDocumentation(query: String) async -> [(path: String, score: Int)] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/mdfind")
 
-        // Search in documentation paths
-        let searchQuery = "kMDItemDisplayName == '*\(query)*'wcd || kMDItemTextContent == '*\(query)*'wcd"
-        process.arguments = [
-            "-onlyin", NSHomeDirectory() + "/Library/Developer/Xcode/DocumentationCache",
-            "-onlyin", "/Applications/Xcode.app/Contents/Developer/Documentation",
-            searchQuery
+        // Build better search query focusing on documentation files
+        // Look for exact matches first, then word-based matches
+        let searchQuery = "(kMDItemDisplayName == '\(query)'wc || kMDItemDisplayName == '*\(query)*'wcd || kMDItemFSName == '*\(query)*.h' || kMDItemFSName == '*\(query)*.swift' || kMDItemTextContent == '*\(query)*'wcd) && (kMDItemContentType == 'public.source-code' || kMDItemContentType == 'public.header' || kMDItemContentType == 'public.documentation')"
+
+        let docPaths = [
+            NSHomeDirectory() + "/Library/Developer/Xcode/DocumentationCache",
+            "/Applications/Xcode.app/Contents/Developer/Documentation",
+            "/Library/Developer/CommandLineTools/SDKs"
         ]
+
+        var args = [String]()
+        for path in docPaths {
+            if FileManager.default.fileExists(atPath: path) {
+                args.append(contentsOf: ["-onlyin", path])
+            }
+        }
+        args.append(searchQuery)
+
+        process.arguments = args
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -357,17 +404,197 @@ final class MCPServer {
 
             let lines = output.components(separatedBy: .newlines)
                 .filter { !$0.isEmpty }
-                .prefix(limit)
 
-            if lines.isEmpty {
-                // Fallback: search in SDK headers using grep
-                return await searchInSDKHeaders(query: query, limit: limit)
+            // Score each result based on relevance
+            return lines.map { path in
+                let score = calculateRelevanceScore(path: path, query: query)
+                return (path: path, score: score)
+            }
+        } catch {
+            return []
+        }
+    }
+
+    private func calculateRelevanceScore(path: String, query: String) -> Int {
+        var score = 0
+        let lowercasePath = path.lowercased()
+        let lowercaseQuery = query.lowercased()
+        let fileName = (path as NSString).lastPathComponent.lowercased()
+
+        // Exact filename match (highest priority)
+        if fileName.contains(lowercaseQuery + ".") || fileName == lowercaseQuery {
+            score += 100
+        }
+
+        // Header or Swift interface file
+        if path.hasSuffix(".h") || path.hasSuffix(".swift") || path.hasSuffix(".swiftinterface") {
+            score += 50
+        }
+
+        // In main framework headers directory
+        if lowercasePath.contains("/frameworks/") && lowercasePath.contains("/headers/") {
+            score += 30
+        }
+
+        // Symbol name is part of path
+        if fileName.hasPrefix(lowercaseQuery) {
+            score += 25
+        }
+
+        // Documentation files
+        if lowercasePath.contains("/documentation/") || lowercasePath.contains(".docarchive") {
+            score += 20
+        }
+
+        // Contains query as whole word
+        if fileName.contains(lowercaseQuery) {
+            score += 15
+        }
+
+        // Framework name matches
+        if let frameworkRange = lowercasePath.range(of: "/frameworks/") {
+            let afterFrameworks = String(lowercasePath[frameworkRange.upperBound...])
+            if afterFrameworks.hasPrefix(lowercaseQuery) {
+                score += 40
+            }
+        }
+
+        return score
+    }
+
+    private func formatSpotlightResults(results: [String], query: String) -> String {
+        var formatted = ["Documentation search results for '\(query)':", ""]
+
+        for (index, path) in results.enumerated() {
+            let fileName = (path as NSString).lastPathComponent
+            var components: [String] = []
+
+            // Extract framework name
+            if let range = path.range(of: "/Frameworks/") {
+                let afterFrameworks = String(path[range.upperBound...])
+                if let frameworkEnd = afterFrameworks.firstIndex(of: "/") {
+                    let framework = String(afterFrameworks[..<frameworkEnd]).replacingOccurrences(of: ".framework", with: "")
+                    components.append("[\(framework)]")
+                }
             }
 
-            return "Documentation search results for '\(query)':\n\n" + lines.joined(separator: "\n")
-        } catch {
-            return "Error searching documentation: \(error.localizedDescription)"
+            // Determine file type
+            if path.hasSuffix(".h") {
+                components.append("Objective-C Header")
+            } else if path.hasSuffix(".swift") || path.hasSuffix(".swiftinterface") {
+                components.append("Swift Interface")
+            } else if path.contains(".docarchive") {
+                components.append("Documentation")
+            }
+
+            components.append(fileName)
+
+            formatted.append("\(index + 1). \(components.joined(separator: " - "))")
+            formatted.append("   Path: \(path)")
+            formatted.append("")
         }
+
+        return formatted.joined(separator: "\n")
+    }
+
+    private func formatCombinedResults(spotlightResults: [(path: String, score: Int)], headerResults: String, query: String, limit: Int) -> String {
+        var output = ["Documentation search results for '\(query)':", ""]
+
+        if !spotlightResults.isEmpty {
+            output.append("## Spotlight Results")
+            output.append("")
+            let sorted = spotlightResults.sorted { $0.score > $1.score }.prefix(limit)
+            output.append(formatSpotlightResults(results: sorted.map { $0.path }, query: query))
+        }
+
+        if !headerResults.contains("No documentation") {
+            output.append("")
+            output.append("## SDK Header Results")
+            output.append("")
+            output.append(headerResults)
+        }
+
+        return output.joined(separator: "\n")
+    }
+
+    private func searchSymbolAcrossFrameworks(query: String, limit: Int) async -> [(framework: String, symbol: String, kind: String)] {
+        // Get common frameworks to search
+        let commonFrameworks = ["Foundation", "SwiftUI", "AppKit", "UIKit", "Combine", "CoreGraphics", "CoreFoundation"]
+        var results: [(framework: String, symbol: String, kind: String)] = []
+
+        for framework in commonFrameworks {
+            if results.count >= limit { break }
+
+            let sdkPath = getSDKPath()
+            let frameworkPath = "\(sdkPath)/System/Library/Frameworks/\(framework).framework"
+
+            guard FileManager.default.fileExists(atPath: frameworkPath) else { continue }
+
+            // Try to extract symbols and search
+            let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+
+            do {
+                try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: tempDir) }
+
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+                process.arguments = [
+                    "swift-symbolgraph-extract",
+                    "-module-name", framework,
+                    "-target", "arm64-apple-macos15.0",
+                    "-sdk", sdkPath,
+                    "-output-dir", tempDir.path,
+                    "-minimum-access-level", "public"
+                ]
+
+                process.standardError = Pipe()
+                process.standardOutput = Pipe()
+
+                try process.run()
+                process.waitUntilExit()
+
+                let symbolGraphPath = tempDir.appendingPathComponent("\(framework).symbols.json")
+
+                if FileManager.default.fileExists(atPath: symbolGraphPath.path) {
+                    let data = try Data(contentsOf: symbolGraphPath)
+                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let symbols = json["symbols"] as? [[String: Any]] {
+
+                        for sym in symbols {
+                            if let names = sym["names"] as? [String: Any],
+                               let title = names["title"] as? String,
+                               title.localizedCaseInsensitiveContains(query),
+                               let kind = sym["kind"] as? [String: Any],
+                               let kindName = kind["displayName"] as? String {
+
+                                results.append((framework: framework, symbol: title, kind: kindName))
+
+                                if results.count >= limit { break }
+                            }
+                        }
+                    }
+                }
+            } catch {
+                continue
+            }
+        }
+
+        return results
+    }
+
+    private func formatSymbolSearchResults(results: [(framework: String, symbol: String, kind: String)], query: String) -> String {
+        var output = ["Found \(results.count) symbol(s) matching '\(query)' across frameworks:", ""]
+
+        for (index, result) in results.enumerated() {
+            output.append("\(index + 1). \(result.symbol)")
+            output.append("   Framework: \(result.framework) - Kind: \(result.kind)")
+            output.append("")
+        }
+
+        output.append("Tip: Use get_symbol_info with the module and symbol name for detailed information.")
+
+        return output.joined(separator: "\n")
     }
 
     private func searchInSDKHeaders(query: String, limit: Int) async -> String {
@@ -429,15 +656,35 @@ final class MCPServer {
 
         // Check if it's a Swift module
         let fileManager = FileManager.default
+        var swiftResult: String? = nil
+
         if fileManager.fileExists(atPath: swiftInterfacePath) {
             // Use swift-symbolgraph-extract for Swift modules
-            return await extractSymbolFromModule(module: module, symbol: symbol, sdkPath: sdkPath)
+            swiftResult = await extractSymbolFromModule(module: module, symbol: symbol, sdkPath: sdkPath)
+
+            // If we found an exact match in Swift, return it
+            // Otherwise, also try Objective-C headers
+            if let result = swiftResult, !result.contains("not found") && !result.contains("Did you mean") {
+                // Check if this is actually an exact match by seeing if the title matches
+                if result.contains("# \(symbol)\n") || result.contains("# \(symbol) ") {
+                    return result
+                }
+            }
         }
 
-        // Fallback: search in Objective-C headers
+        // Try Objective-C headers
         let headerPath = "\(sdkPath)/System/Library/Frameworks/\(module).framework/Headers"
         if fileManager.fileExists(atPath: headerPath) {
-            return await searchSymbolInHeaders(symbol: symbol, headerPath: headerPath, module: module)
+            let headerResult = await searchSymbolInHeaders(symbol: symbol, headerPath: headerPath, module: module)
+            // Prefer Objective-C result if it's not "not found"
+            if !headerResult.contains("not found") {
+                return headerResult
+            }
+        }
+
+        // Return Swift result if we have one, otherwise error
+        if let result = swiftResult {
+            return result
         }
 
         return "Module '\(module)' not found in SDK. Use list_frameworks to see available modules."
@@ -476,25 +723,45 @@ final class MCPServer {
                 if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let symbols = json["symbols"] as? [[String: Any]] {
 
-                    // Find the requested symbol
+                    // Find the requested symbol - prioritize exact matches
+                    var exactMatch: [String: Any]?
+                    var partialMatch: [String: Any]?
+
                     for sym in symbols {
                         if let names = sym["names"] as? [String: Any],
-                           let title = names["title"] as? String,
-                           title.localizedCaseInsensitiveContains(symbol) {
+                           let title = names["title"] as? String {
+
+                            // Check for exact match first
+                            if title == symbol || title.lowercased() == symbol.lowercased() {
+                                exactMatch = sym
+                                break
+                            }
+
+                            // Keep first partial match as fallback
+                            if partialMatch == nil && title.localizedCaseInsensitiveContains(symbol) {
+                                partialMatch = sym
+                            }
+                        }
+                    }
+
+                    // Use exact match if found, otherwise use partial match
+                    if let foundSymbol = exactMatch ?? partialMatch {
+                        if let names = foundSymbol["names"] as? [String: Any],
+                           let title = names["title"] as? String {
 
                             var info: [String] = ["# \(title)"]
 
-                            if let kind = sym["kind"] as? [String: Any],
+                            if let kind = foundSymbol["kind"] as? [String: Any],
                                let kindName = kind["displayName"] as? String {
                                 info.append("**Kind:** \(kindName)")
                             }
 
-                            if let declaration = sym["declarationFragments"] as? [[String: Any]] {
+                            if let declaration = foundSymbol["declarationFragments"] as? [[String: Any]] {
                                 let declString = declaration.compactMap { $0["spelling"] as? String }.joined()
                                 info.append("\n**Declaration:**\n```swift\n\(declString)\n```")
                             }
 
-                            if let docComment = sym["docComment"] as? [String: Any],
+                            if let docComment = foundSymbol["docComment"] as? [String: Any],
                                let lines = docComment["lines"] as? [[String: Any]] {
                                 let docText = lines.compactMap { $0["text"] as? String }.joined(separator: "\n")
                                 info.append("\n**Documentation:**\n\(docText)")
