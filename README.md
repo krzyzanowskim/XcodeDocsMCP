@@ -18,7 +18,7 @@ MCP server for querying Apple developer documentation and SDK symbols from your 
 ## Installation
 
 ```bash
-brew tap krzyzanowskim/formulae
+brew tap krzyzanowskim/tap
 brew install xcode-docs-mcp
 ```
 
