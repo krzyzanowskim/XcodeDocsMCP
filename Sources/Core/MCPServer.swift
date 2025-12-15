@@ -727,14 +727,23 @@ public final class MCPServer {
             // Use swift-symbolgraph-extract for Swift modules
             swiftResult = await extractSymbolFromModule(module: module, symbol: symbol, sdkPath: sdkPath)
 
-            // If we found an exact match in Swift, return it
-            // Otherwise, also try Objective-C headers
+            // If we found an exact case-sensitive match in Swift, return it
+            // Otherwise, also try other fallbacks (swiftinterface, headers)
             if let result = swiftResult, !result.contains("not found") && !result.contains("Did you mean") {
-                // Check if this is actually an exact match by seeing if the title matches
-                if result.contains("# \(symbol)\n") || result.contains("# \(symbol) ") {
+                // Check if this is actually an exact case-sensitive match
+                // The result format is "# SymbolName\n" so we check for exact match
+                if result.hasPrefix("# \(symbol)\n") {
                     return result
                 }
+                // If we found something but it's not an exact match (e.g., found "text" when looking for "Text"),
+                // continue to try other fallbacks
             }
+        }
+
+        // Fallback: Try searching .swiftinterface files directly
+        // This catches types like SwiftUI.Text that aren't in the symbol graph
+        if let interfaceResult = await searchSymbolInSwiftInterface(module: module, symbol: symbol, sdkPath: sdkPath) {
+            return interfaceResult
         }
 
         // Try Objective-C headers
@@ -747,7 +756,7 @@ public final class MCPServer {
             }
         }
 
-        // Return Swift result if we have one, otherwise error
+        // Return Swift result if we have one (may contain suggestions), otherwise error
         if let result = swiftResult {
             return result
         }
@@ -906,6 +915,165 @@ public final class MCPServer {
         } catch {
             return "Error searching headers: \(error.localizedDescription)"
         }
+    }
+
+    private func searchSymbolInSwiftInterface(module: String, symbol: String, sdkPath: String) async -> String? {
+        let fileManager = FileManager.default
+
+        // Build list of possible swiftinterface paths
+        // Some modules (like SwiftUI) have their types in Core modules (SwiftUICore)
+        var modulesToSearch = [module]
+        if module == "SwiftUI" {
+            modulesToSearch.append("SwiftUICore")
+        } else if module == "Foundation" {
+            modulesToSearch.append("FoundationEssentials")
+        }
+
+        for searchModule in modulesToSearch {
+            let frameworkPath = "\(sdkPath)/System/Library/Frameworks/\(searchModule).framework"
+            let swiftmodulePath = "\(frameworkPath)/Modules/\(searchModule).swiftmodule"
+
+            guard fileManager.fileExists(atPath: swiftmodulePath) else { continue }
+
+            // Find the appropriate .swiftinterface file (prefer arm64)
+            let interfaceFiles = (try? fileManager.contentsOfDirectory(atPath: swiftmodulePath))?
+                .filter { $0.hasSuffix(".swiftinterface") } ?? []
+
+            let interfaceFile = interfaceFiles.first { $0.contains("arm64") }
+                ?? interfaceFiles.first { $0.contains("x86_64") }
+                ?? interfaceFiles.first
+
+            guard let interfaceFileName = interfaceFile else { continue }
+
+            let interfacePath = "\(swiftmodulePath)/\(interfaceFileName)"
+
+            // Use grep to find the symbol definition
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/grep")
+            // Search for type definitions: struct, class, enum, protocol, typealias, actor
+            // Match lines containing "public struct Symbol" or "@frozen public struct Symbol" etc.
+            // The pattern needs to handle various attributes before the declaration
+            process.arguments = [
+                "-E", "-B", "5", "-A", "30",
+                "(public |open )(struct|class|enum|protocol|typealias|actor) \(symbol)( |:|<|$)",
+                interfacePath
+            ]
+
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+
+            do {
+                try process.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+
+                let output = String(data: data, encoding: .utf8) ?? ""
+
+                if !output.isEmpty {
+                    // Parse and format the output
+                    return formatSwiftInterfaceResult(output: output, symbol: symbol, module: module, actualModule: searchModule)
+                }
+            } catch {
+                continue
+            }
+        }
+
+        return nil
+    }
+
+    private func formatSwiftInterfaceResult(output: String, symbol: String, module: String, actualModule: String) -> String {
+        let lines = output.components(separatedBy: .newlines)
+        var result: [String] = []
+
+        // Extract availability info
+        var availability: String? = nil
+        var declarationStartIndex = 0
+
+        for (index, line) in lines.enumerated() {
+            if line.contains("@available") {
+                // Extract availability platforms
+                if let match = line.range(of: #"@available\((.*?)\)"#, options: .regularExpression) {
+                    let avail = String(line[match])
+                    if avail.contains("iOS") || avail.contains("macOS") {
+                        availability = avail
+                    }
+                }
+            }
+            if line.contains("public struct \(symbol)") ||
+               line.contains("public class \(symbol)") ||
+               line.contains("public enum \(symbol)") ||
+               line.contains("public protocol \(symbol)") ||
+               line.contains("open class \(symbol)") ||
+               line.contains("public actor \(symbol)") {
+                declarationStartIndex = index
+                break
+            }
+        }
+
+        // Find the kind
+        let firstDeclLine = lines[declarationStartIndex]
+        let kind: String
+        if firstDeclLine.contains("struct") { kind = "Structure" }
+        else if firstDeclLine.contains("class") { kind = "Class" }
+        else if firstDeclLine.contains("enum") { kind = "Enumeration" }
+        else if firstDeclLine.contains("protocol") { kind = "Protocol" }
+        else if firstDeclLine.contains("actor") { kind = "Actor" }
+        else { kind = "Type" }
+
+        result.append("# \(symbol)")
+        result.append("**Kind:** \(kind)")
+
+        if let avail = availability {
+            result.append("**Availability:** \(avail)")
+        }
+
+        if module != actualModule {
+            result.append("**Note:** Defined in \(actualModule), re-exported by \(module)")
+        }
+
+        // Extract declaration - find balanced braces
+        var declaration: [String] = []
+        var braceCount = 0
+        var started = false
+
+        for i in declarationStartIndex..<min(declarationStartIndex + 50, lines.count) {
+            let line = lines[i]
+
+            // Skip internal/package/usableFromInline items
+            if line.contains("@usableFromInline") || line.contains("package ") ||
+               (line.contains("internal ") && !line.contains("internalParam")) {
+                continue
+            }
+
+            // Skip attributes we don't want to show
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("@_") {
+                continue
+            }
+
+            declaration.append(line)
+
+            braceCount += line.filter { $0 == "{" }.count
+            braceCount -= line.filter { $0 == "}" }.count
+
+            if line.contains("{") { started = true }
+            if started && braceCount <= 0 { break }
+
+            // Limit declaration size
+            if declaration.count > 30 { break }
+        }
+
+        // Clean up the declaration
+        let cleanDeclaration = declaration
+            .map { $0.replacingOccurrences(of: "SwiftUICore.", with: "") }
+            .map { $0.replacingOccurrences(of: "Swift.", with: "") }
+            .map { $0.replacingOccurrences(of: "Foundation.", with: "") }
+            .map { $0.replacingOccurrences(of: "CoreFoundation.", with: "") }
+            .joined(separator: "\n")
+
+        result.append("\n**Declaration:**\n```swift\n\(cleanDeclaration)\n```")
+
+        return result.joined(separator: "\n")
     }
 
     public func listFrameworks(filter: String?) async -> String {
