@@ -299,13 +299,31 @@ final class MCPServer {
 
         switch toolName {
         case "search_documentation":
-            let query = arguments["query"] as? String ?? ""
+            guard let query = arguments["query"] as? String, !query.isEmpty else {
+                return JSONRPCResponse(
+                    id: request.id,
+                    result: nil,
+                    error: JSONRPCError(code: -32602, message: "Missing required parameter: query", data: nil)
+                )
+            }
             let limit = arguments["limit"] as? Int ?? 20
             result = await searchDocumentation(query: query, limit: limit)
 
         case "get_symbol_info":
-            let module = arguments["module"] as? String ?? ""
-            let symbol = arguments["symbol"] as? String ?? ""
+            guard let module = arguments["module"] as? String, !module.isEmpty else {
+                return JSONRPCResponse(
+                    id: request.id,
+                    result: nil,
+                    error: JSONRPCError(code: -32602, message: "Missing required parameter: module", data: nil)
+                )
+            }
+            guard let symbol = arguments["symbol"] as? String, !symbol.isEmpty else {
+                return JSONRPCResponse(
+                    id: request.id,
+                    result: nil,
+                    error: JSONRPCError(code: -32602, message: "Missing required parameter: symbol", data: nil)
+                )
+            }
             result = await getSymbolInfo(module: module, symbol: symbol)
 
         case "list_frameworks":
@@ -313,7 +331,13 @@ final class MCPServer {
             result = await listFrameworks(filter: filter)
 
         case "extract_module_symbols":
-            let module = arguments["module"] as? String ?? ""
+            guard let module = arguments["module"] as? String, !module.isEmpty else {
+                return JSONRPCResponse(
+                    id: request.id,
+                    result: nil,
+                    error: JSONRPCError(code: -32602, message: "Missing required parameter: module", data: nil)
+                )
+            }
             let kind = arguments["kind"] as? String ?? "all"
             result = await extractModuleSymbols(module: module, kind: kind)
 
@@ -340,6 +364,8 @@ final class MCPServer {
 
     private func searchDocumentation(query: String, limit: Int) async -> String {
         var allResults: [(path: String, score: Int)] = []
+        var headerResults: String? = nil
+        var symbolResults: [(framework: String, symbol: String, kind: String)] = []
 
         // Strategy 1: Search documentation cache with better query
         let docResults = await searchSpotlightDocumentation(query: query)
@@ -347,23 +373,31 @@ final class MCPServer {
 
         // Strategy 2: Search SDK headers if we don't have enough results
         if allResults.count < limit {
-            let headerResults = await searchInSDKHeaders(query: query, limit: limit)
-            // Parse header results into paths (this returns formatted string, so we'll handle separately)
-            if !headerResults.contains("No documentation found") && !headerResults.contains("Error") {
-                return formatCombinedResults(spotlightResults: allResults, headerResults: headerResults, query: query, limit: limit)
+            let headers = await searchInSDKHeaders(query: query, limit: limit)
+            if !headers.contains("No documentation found") && !headers.contains("Error") {
+                headerResults = headers
             }
         }
 
         // Strategy 3: Try case-insensitive symbol name search in frameworks
+        // Run this even if we have header results, when spotlight results are few
         if allResults.count < 5 {
-            let symbolResults = await searchSymbolAcrossFrameworks(query: query, limit: 10)
-            if !symbolResults.isEmpty {
-                return formatSymbolSearchResults(results: symbolResults, query: query)
-            }
+            symbolResults = await searchSymbolAcrossFrameworks(query: query, limit: 10)
         }
 
-        if allResults.isEmpty {
+        // Combine and format results based on what we found
+        if allResults.isEmpty && headerResults == nil && symbolResults.isEmpty {
             return "No documentation found for '\(query)'.\n\nSuggestions:\n- Try searching for a more specific symbol name\n- Use get_symbol_info if you know the framework (e.g., Foundation, SwiftUI)\n- Use list_frameworks to see available frameworks"
+        }
+
+        // If we have symbol results and few other results, prefer symbol format
+        if !symbolResults.isEmpty && allResults.count < 3 && headerResults == nil {
+            return formatSymbolSearchResults(results: symbolResults, query: query)
+        }
+
+        // If we have header results, include them in combined output
+        if let headers = headerResults {
+            return formatCombinedResults(spotlightResults: allResults, headerResults: headers, query: query, limit: limit)
         }
 
         // Sort by relevance score and format results
@@ -378,9 +412,12 @@ final class MCPServer {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/mdfind")
 
+        // Escape single quotes in query to prevent Spotlight query injection
+        let escapedQuery = query.replacingOccurrences(of: "'", with: "\\'")
+
         // Build better search query focusing on documentation files
         // Look for exact matches first, then word-based matches
-        let searchQuery = "(kMDItemDisplayName == '\(query)'wc || kMDItemDisplayName == '*\(query)*'wcd || kMDItemFSName == '*\(query)*.h' || kMDItemFSName == '*\(query)*.swift' || kMDItemTextContent == '*\(query)*'wcd) && (kMDItemContentType == 'public.source-code' || kMDItemContentType == 'public.header' || kMDItemContentType == 'public.documentation')"
+        let searchQuery = "(kMDItemDisplayName == '\(escapedQuery)'wc || kMDItemDisplayName == '*\(escapedQuery)*'wcd || kMDItemFSName == '*\(escapedQuery)*.h' || kMDItemFSName == '*\(escapedQuery)*.swift' || kMDItemTextContent == '*\(escapedQuery)*'wcd) && (kMDItemContentType == 'public.source-code' || kMDItemContentType == 'public.header' || kMDItemContentType == 'public.documentation')"
 
         let docPaths = [
             NSHomeDirectory() + "/Library/Developer/Xcode/DocumentationCache",
@@ -400,13 +437,15 @@ final class MCPServer {
 
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        // Discard stderr to avoid potential deadlock (we don't need it)
+        process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()
+            // Read output before waitUntilExit to avoid pipe buffer deadlock
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
 
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let output = String(data: data, encoding: .utf8) ?? ""
 
             let lines = output.components(separatedBy: .newlines)
@@ -555,10 +594,14 @@ final class MCPServer {
                     "-minimum-access-level", "public"
                 ]
 
-                process.standardError = Pipe()
-                process.standardOutput = Pipe()
+                // Discard stderr to avoid potential deadlock (we don't need it here)
+                process.standardError = FileHandle.nullDevice
+                let outputPipe = Pipe()
+                process.standardOutput = outputPipe
 
                 try process.run()
+                // Read output before waitUntilExit to avoid pipe buffer deadlock
+                _ = outputPipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
 
                 let symbolGraphPath = tempDir.appendingPathComponent("\(framework).symbols.json")
@@ -619,13 +662,15 @@ final class MCPServer {
 
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        // Discard stderr to avoid potential deadlock (we don't need it)
+        process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()
+            // Read output before waitUntilExit to avoid pipe buffer deadlock
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
 
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let output = String(data: data, encoding: .utf8) ?? ""
 
             let lines = output.components(separatedBy: .newlines)
@@ -715,9 +760,9 @@ final class MCPServer {
                 "-minimum-access-level", "public"
             ]
 
-            let errorPipe = Pipe()
-            process.standardError = errorPipe
-            process.standardOutput = Pipe()
+            // Discard stdout/stderr to avoid deadlock - output goes to file, we check terminationStatus for errors
+            process.standardError = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
 
             try process.run()
             process.waitUntilExit()
@@ -792,12 +837,8 @@ final class MCPServer {
                 }
             }
 
-            // If symbolgraph extraction failed, check error
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
-
-            if !errorOutput.isEmpty && process.terminationStatus != 0 {
-                // Fallback to header search
+            // If symbolgraph extraction failed, fallback to header search
+            if process.terminationStatus != 0 {
                 let headerPath = "\(sdkPath)/System/Library/Frameworks/\(module).framework/Headers"
                 return await searchSymbolInHeaders(symbol: symbol, headerPath: headerPath, module: module)
             }
@@ -821,13 +862,15 @@ final class MCPServer {
 
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        // Discard stderr to avoid potential deadlock (we don't need it)
+        process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()
+            // Read output before waitUntilExit to avoid pipe buffer deadlock
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
 
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let output = String(data: data, encoding: .utf8) ?? ""
 
             if output.isEmpty {
@@ -888,8 +931,9 @@ final class MCPServer {
                 "-minimum-access-level", "public"
             ]
 
-            process.standardError = Pipe()
-            process.standardOutput = Pipe()
+            // Discard stdout/stderr to avoid potential deadlock (output goes to file)
+            process.standardError = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
 
             try process.run()
             process.waitUntilExit()
@@ -963,13 +1007,15 @@ final class MCPServer {
 
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = Pipe()
+        // Discard stderr to avoid potential deadlock (we don't need it)
+        process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()
+            // Read output before waitUntilExit to avoid pipe buffer deadlock
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
 
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
             if !output.isEmpty {
