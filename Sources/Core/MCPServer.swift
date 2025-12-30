@@ -134,6 +134,13 @@ public struct AnyCodable: Codable, Sendable {
 public final class MCPServer {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let supportedProtocolVersions = ["2025-06-18", "2024-11-05"]
+
+    enum MessageOutput {
+        case none
+        case single(JSONRPCResponse)
+        case batch([JSONRPCResponse])
+    }
 
     public let serverInfo: [String: any Sendable] = [
         "name": "xcode-docs-mcp",
@@ -141,7 +148,9 @@ public final class MCPServer {
     ]
 
     public let capabilities: [String: any Sendable] = [
-        "tools": [String: any Sendable]()
+        "tools": [
+            "listChanged": false
+        ] as [String: any Sendable]
     ]
 
     public init() {
@@ -151,22 +160,80 @@ public final class MCPServer {
     public func run() async {
         // Read from stdin line by line
         while let line = readLine() {
-            guard !line.isEmpty else { continue }
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
 
-            do {
-                let request = try decoder.decode(JSONRPCRequest.self, from: Data(line.utf8))
-                let response = await handleRequest(request)
-                if let response = response {
-                    try sendResponse(response)
-                }
-            } catch {
-                let errorResponse = JSONRPCResponse(
-                    id: nil,
-                    result: nil,
-                    error: JSONRPCError(code: -32700, message: "Parse error: \(error.localizedDescription)", data: nil)
-                )
-                try? sendResponse(errorResponse)
+            let output = await processMessageData(Data(trimmed.utf8))
+            switch output {
+            case .none:
+                continue
+            case .single(let response):
+                try? sendResponse(response)
+            case .batch(let responses):
+                try? sendResponses(responses)
             }
+        }
+    }
+
+    func processMessageData(_ data: Data) async -> MessageOutput {
+        do {
+            let json = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+            return await handleJSONPayload(json)
+        } catch {
+            return .single(parseErrorResponse(message: error.localizedDescription))
+        }
+    }
+
+    private func handleJSONPayload(_ json: Any) async -> MessageOutput {
+        if let array = json as? [Any] {
+            return await handleBatchObjects(array)
+        }
+
+        return await handleSingleObject(json)
+    }
+
+    private func handleBatchObjects(_ objects: [Any]) async -> MessageOutput {
+        guard !objects.isEmpty else {
+            return .single(invalidRequestResponse())
+        }
+
+        var responses: [JSONRPCResponse] = []
+        for object in objects {
+            guard let request = decodeRequest(from: object) else {
+                responses.append(invalidRequestResponse())
+                continue
+            }
+
+            if let response = await handleRequest(request) {
+                responses.append(response)
+            }
+        }
+
+        return responses.isEmpty ? .none : .batch(responses)
+    }
+
+    private func handleSingleObject(_ object: Any) async -> MessageOutput {
+        guard let request = decodeRequest(from: object) else {
+            return .single(invalidRequestResponse())
+        }
+
+        guard let response = await handleRequest(request) else {
+            return .none
+        }
+
+        return .single(response)
+    }
+
+    private func decodeRequest(from object: Any) -> JSONRPCRequest? {
+        guard let dictionary = object as? [String: Any] else {
+            return nil
+        }
+
+        do {
+            let data = try JSONSerialization.data(withJSONObject: dictionary, options: [])
+            return try decoder.decode(JSONRPCRequest.self, from: data)
+        } catch {
+            return nil
         }
     }
 
@@ -178,21 +245,70 @@ public final class MCPServer {
         }
     }
 
+    private func sendResponses(_ responses: [JSONRPCResponse]) throws {
+        let data = try encoder.encode(responses)
+        if let jsonString = String(data: data, encoding: .utf8) {
+            print(jsonString)
+            fflush(stdout)
+        }
+    }
+
+    private func invalidRequestResponse() -> JSONRPCResponse {
+        JSONRPCResponse(
+            id: .null,
+            result: nil,
+            error: JSONRPCError(code: -32600, message: "Invalid Request", data: nil)
+        )
+    }
+
+    private func parseErrorResponse(message: String) -> JSONRPCResponse {
+        JSONRPCResponse(
+            id: .null,
+            result: nil,
+            error: JSONRPCError(code: -32700, message: "Parse error: \(message)", data: nil)
+        )
+    }
+
+    private func negotiatedProtocolVersion(from params: AnyCodable?) -> String {
+        guard let params = params?.value as? [String: any Sendable],
+              let clientVersion = params["protocolVersion"] as? String else {
+            return supportedProtocolVersions[0]
+        }
+
+        if supportedProtocolVersions.contains(clientVersion) {
+            return clientVersion
+        }
+
+        return supportedProtocolVersions[0]
+    }
+
     public func handleRequest(_ request: JSONRPCRequest) async -> JSONRPCResponse? {
+        let isNotification: Bool
+        switch request.id {
+        case .none, .some(.null):
+            isNotification = true
+        case .some:
+            isNotification = false
+        }
+
+        if isNotification {
+            return nil
+        }
+
         switch request.method {
         case "initialize":
+            let protocolVersion = negotiatedProtocolVersion(from: request.params)
             return JSONRPCResponse(
                 id: request.id,
                 result: AnyCodable([
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": protocolVersion,
                     "serverInfo": serverInfo,
                     "capabilities": capabilities
                 ] as [String: any Sendable]),
                 error: nil
             )
 
-        case "initialized":
-            // Notification, no response needed
+        case "initialized", "notifications/initialized":
             return nil
 
         case "tools/list":
@@ -367,7 +483,8 @@ public final class MCPServer {
             result: AnyCodable([
                 "content": [
                     ["type": "text", "text": result] as [String: any Sendable]
-                ] as [any Sendable]
+                ] as [any Sendable],
+                "isError": false
             ] as [String: any Sendable]),
             error: nil
         )
