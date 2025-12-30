@@ -190,14 +190,14 @@ final class JSONRPCRequestTests: XCTestCase {
 
     func testDecodeNotification() throws {
         let json = """
-        {"jsonrpc": "2.0", "method": "initialized"}
+        {"jsonrpc": "2.0", "method": "notifications/initialized"}
         """
         let data = Data(json.utf8)
         let request = try JSONDecoder().decode(JSONRPCRequest.self, from: data)
 
         XCTAssertEqual(request.jsonrpc, "2.0")
         XCTAssertNil(request.id)
-        XCTAssertEqual(request.method, "initialized")
+        XCTAssertEqual(request.method, "notifications/initialized")
     }
 
     func testEncodeRequest() throws {
@@ -288,9 +288,31 @@ final class MCPServerRequestHandlingTests: XCTestCase {
         XCTAssertNotNil(response?.result)
 
         let result = response?.result?.value as? [String: Any]
-        XCTAssertEqual(result?["protocolVersion"] as? String, "2024-11-05")
+        XCTAssertEqual(result?["protocolVersion"] as? String, "2025-06-18")
         XCTAssertNotNil(result?["serverInfo"])
-        XCTAssertNotNil(result?["capabilities"])
+        let capabilities = result?["capabilities"] as? [String: Any]
+        XCTAssertNotNil(capabilities)
+        let toolsCaps = capabilities?["tools"] as? [String: Any]
+        XCTAssertEqual(toolsCaps?["listChanged"] as? Bool, false)
+    }
+
+    @MainActor
+    func testInitializeRequestWithOlderVersion() async {
+        let server = MCPServer()
+        let request = JSONRPCRequest(
+            id: .int(1),
+            method: "initialize",
+            params: AnyCodable([
+                "protocolVersion": "2024-11-05",
+                "capabilities": [String: String](),
+                "clientInfo": ["name": "test", "version": "1.0"] as [String: String]
+            ] as [String: any Sendable])
+        )
+
+        let response = await server.handleRequest(request)
+
+        let result = response?.result?.value as? [String: Any]
+        XCTAssertEqual(result?["protocolVersion"] as? String, "2024-11-05")
     }
 
     @MainActor
@@ -298,13 +320,27 @@ final class MCPServerRequestHandlingTests: XCTestCase {
         let server = MCPServer()
         let request = JSONRPCRequest(
             id: nil,
-            method: "initialized",
+            method: "notifications/initialized",
             params: nil
         )
 
         let response = await server.handleRequest(request)
 
         // Notifications don't get responses
+        XCTAssertNil(response)
+    }
+
+    @MainActor
+    func testUnknownNotificationDoesNotRespond() async {
+        let server = MCPServer()
+        let request = JSONRPCRequest(
+            id: nil,
+            method: "notifications/unknown",
+            params: nil
+        )
+
+        let response = await server.handleRequest(request)
+
         XCTAssertNil(response)
     }
 
@@ -798,6 +834,57 @@ final class IntegrationTests: XCTestCase {
     }
 }
 
+// MARK: - MCPServer Message Processing Tests
+
+final class MCPServerMessageProcessingTests: XCTestCase {
+
+    @MainActor
+    func testProcessMessageEmptyBatchReturnsInvalidRequest() async {
+        let server = MCPServer()
+        let output = await server.processMessageData(Data("[]".utf8))
+
+        switch output {
+        case .single(let response):
+            XCTAssertEqual(response.id, .null)
+            XCTAssertEqual(response.error?.code, -32600)
+        default:
+            XCTFail("Expected single invalid request response for empty batch")
+        }
+    }
+
+    @MainActor
+    func testProcessMessageBatchWithInvalidElement() async {
+        let server = MCPServer()
+        let json = "[{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"ping\"}, 1]"
+        let output = await server.processMessageData(Data(json.utf8))
+
+        switch output {
+        case .batch(let responses):
+            XCTAssertEqual(responses.count, 2)
+            XCTAssertEqual(responses[0].id, .int(1))
+            XCTAssertNil(responses[0].error)
+            XCTAssertEqual(responses[1].id, .null)
+            XCTAssertEqual(responses[1].error?.code, -32600)
+        default:
+            XCTFail("Expected batch responses for mixed valid and invalid requests")
+        }
+    }
+
+    @MainActor
+    func testProcessMessageInvalidSingleReturnsInvalidRequest() async {
+        let server = MCPServer()
+        let output = await server.processMessageData(Data("1".utf8))
+
+        switch output {
+        case .single(let response):
+            XCTAssertEqual(response.id, .null)
+            XCTAssertEqual(response.error?.code, -32600)
+        default:
+            XCTFail("Expected invalid request response for non-object payload")
+        }
+    }
+}
+
 // MARK: - End-to-End Protocol Tests
 
 final class EndToEndProtocolTests: XCTestCase {
@@ -811,7 +898,7 @@ final class EndToEndProtocolTests: XCTestCase {
             id: .int(1),
             method: "initialize",
             params: AnyCodable([
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-06-18",
                 "capabilities": [String: String](),
                 "clientInfo": ["name": "test", "version": "1.0"] as [String: String]
             ] as [String: any Sendable])
@@ -824,7 +911,7 @@ final class EndToEndProtocolTests: XCTestCase {
         // 2. Send initialized notification
         let initializedNotification = JSONRPCRequest(
             id: nil,
-            method: "initialized",
+            method: "notifications/initialized",
             params: nil
         )
 
@@ -870,6 +957,8 @@ final class EndToEndProtocolTests: XCTestCase {
         let content = result?["content"] as? [[String: Any]]
         XCTAssertNotNil(content)
         XCTAssertGreaterThan(content?.count ?? 0, 0)
+
+        XCTAssertEqual(result?["isError"] as? Bool, false)
 
         let firstContent = content?.first
         XCTAssertEqual(firstContent?["type"] as? String, "text")

@@ -30,6 +30,17 @@ swift build -c release
 
 ## Configuration
 
+Codex CLI (`~/.codex/config.toml`):
+```toml
+[mcp_servers.xcode-docs]
+command = "xcode-docs-mcp"
+```
+
+Or via CLI:
+```bash
+codex mcp add xcode-docs -- xcode-docs-mcp
+```
+
 Claude Code:
 ```bash
 claude mcp add --scope user xcode-docs-mcp xcode-docs-mcp
